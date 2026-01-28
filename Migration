@@ -13,6 +13,7 @@ FEATURE_BRANCH = f"task-{JIRA_ID}-{UPGRADE_TYPE}"
 SOURCE_BRANCH = "develop"
 MR_TITLE = f"TASK-{JIRA_ID}: java migration"
 
+# Migration Targets
 TARGET_PARENT_VERSION = "1.8.4"
 NEW_DEFAULT_PLATFORM = "arn:aws:elasticbeanstalk:placeholder::platform/Corretto"
 
@@ -39,7 +40,9 @@ def api_call(endpoint, method="GET", data=None):
 
 def update_parent_block(match):
     block = match.group(0)
+    # Updates the version inside the <parent> tag
     block = re.sub(r"(<version>).*?(</version>)", lambda m: m.group(1) + TARGET_PARENT_VERSION + m.group(2), block)
+    # Updates the file name if it exists in the relativePath
     block = re.sub(r"(parent-pom-).*?(\.xml)", lambda m: m.group(1) + TARGET_PARENT_VERSION + m.group(2), block)
     return block
 
@@ -53,60 +56,97 @@ def main():
     dry_run = input("\nEnable Dry Run (No changes committed)? (y/n): ").lower() == 'y'
     
     print("\nSelect Updates (Enter comma-separated numbers, e.g., 1,2,3):")
-    print("1: Update pom.xml\n2: Update .gitlab-ci.yml\n3: Update EB config.yml")
+    print("1: Update pom.xml (Java 17, Source/Target, Release, Parent)")
+    print("2: Update .gitlab-ci.yml (Clean image)")
+    print("3: Update .elasticbeanstalk/config.yml")
     choices = input("Choices: ").replace(" ", "").split(',')
     
     do_tag = input("\nDo you want to manage tags (Terminate/Refresh)? (y/n): ").lower() == 'y'
     tag_action = 'n'
     if do_tag:
-        print("t: Terminate only | r: Refresh (Delete & Recreate)")
-        tag_action = input("Select tag action (t/r): ").lower()
+        tag_action = input("Select tag action (t: Terminate only | r: Refresh): ").lower()
 
     for pid in PROJECT_IDS:
-        log(f"--- Starting Project ID: {pid} ---")
+        log(f"--- Processing Project ID: {pid} ---")
         actions = []
         
         branch_check = api_call(f"projects/{pid}/repository/branches/{FEATURE_BRANCH}")
         current_ref = FEATURE_BRANCH if "name" in branch_check else SOURCE_BRANCH
         
-        # 1-3. Transformation logic (POM, CI, EB)
-        # (Included in full script implementation)
-        
+        # --- 1. pom.xml DETAILED UPDATES ---
+        if '1' in choices:
+            res = api_call(f"projects/{pid}/repository/files/pom.xml?ref={current_ref}")
+            if isinstance(res, dict) and "content" in res:
+                original = base64.b64decode(res['content']).decode('utf-8')
+                updated = original
+                
+                # Update <java.version>
+                updated = re.sub(r"<java\.version>.*?</java\.version>", "<java.version>17</java.version>", updated)
+                
+                # Update Maven Source/Target
+                updated = re.sub(r"<maven\.compiler\.source>.*?</maven\.compiler\.source>", "<maven.compiler.source>17</maven.compiler.source>", updated)
+                updated = re.sub(r"<maven\.compiler\.target>.*?</maven\.compiler\.target>", "<maven.compiler.target>17</maven.compiler.target>", updated)
+                
+                # Update/Add <maven.compiler.release> (Best practice for Java 9+)
+                if "<maven.compiler.release>" in updated:
+                    updated = re.sub(r"<maven\.compiler\.release>.*?</maven\.compiler\.release>", "<maven.compiler.release>17</maven.compiler.release>", updated)
+                
+                # Update Parent Block
+                if re.search(r"(<parent>[\s\S]*?</parent>)", updated):
+                    updated = re.sub(r"(<parent>[\s\S]*?</parent>)", update_parent_block, updated)
+                
+                if original != updated:
+                    actions.append({"action": "update", "file_path": "pom.xml", "content": updated})
+                    log("   [DIFF] pom.xml Java 17 updates staged.")
+
+        # --- 2. .gitlab-ci.yml ---
+        if '2' in choices:
+            res = api_call(f"projects/{pid}/repository/files/.gitlab-ci.yml?ref={current_ref}")
+            if isinstance(res, dict) and "content" in res:
+                original = base64.b64decode(res['content']).decode('utf-8')
+                updated = re.sub(r"(maven-build:[\s\S]*?)\n\s*image:.*?\n", r"\1\n", original)
+                if original != updated:
+                    actions.append({"action": "update", "file_path": ".gitlab-ci.yml", "content": updated})
+
+        # --- 3. EB config.yml ---
+        if '3' in choices:
+            eb_path = ".elasticbeanstalk/config.yml"
+            res = api_call(f"projects/{pid}/repository/files/{urllib.parse.quote(eb_path, safe='')}?ref={current_ref}")
+            if isinstance(res, dict) and "content" in res:
+                original = base64.b64decode(res['content']).decode('utf-8')
+                updated = re.sub(r"(default_platform:\s*).*$", f"default_platform: {NEW_DEFAULT_PLATFORM}", original, flags=re.MULTILINE)
+                if original != updated:
+                    actions.append({"action": "update", "file_path": eb_path, "content": updated})
+
         # --- EXECUTION ---
         if actions and not dry_run:
             if "name" not in branch_check:
                 api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH})
             api_call(f"projects/{pid}/repository/commits", "POST", {"branch": FEATURE_BRANCH, "commit_message": f"fix: {UPGRADE_TYPE}", "actions": actions})
             
-            confirm_mr = input(f"   ❓ Pushed. Raise/Update MR for {pid}? (y/n): ").lower()
-            if confirm_mr == 'y':
+            if input(f"   ❓ Raise/Update MR for {pid}? (y/n): ").lower() == 'y':
                 mr_res = api_call(f"projects/{pid}/merge_requests", "POST", {"source_branch": FEATURE_BRANCH, "target_branch": SOURCE_BRANCH, "title": MR_TITLE})
                 if isinstance(mr_res, dict) and mr_res.get("error_code") == 409:
                     mrs = api_call(f"projects/{pid}/merge_requests?source_branch={FEATURE_BRANCH}")
                     if mrs: api_call(f"projects/{pid}/merge_requests/{mrs[0]['iid']}", "PUT", {"title": MR_TITLE})
-                log(f"   [SUCCESS] MR handled.")
+                log("   [SUCCESS] MR handled.")
 
         # --- TAG MANAGEMENT ---
         if do_tag and not dry_run:
             for tag in ["dev", "azure-dev"]:
                 exists = api_call(f"projects/{pid}/repository/tags/{tag}")
                 if isinstance(exists, dict) and "name" in exists:
-                    log(f"   🏷️ Existing tag '{tag}' found. Attempting {tag_action}...")
                     dr = api_call(f"projects/{pid}/repository/tags/{tag}", method="DELETE")
-                    
                     if isinstance(dr, dict) and dr.get("error_code") == 403:
-                        log(f"   ⚠️ Cannot delete '{tag}': Tag is protected.", "WARN")
+                        log(f"   ⚠️ {tag} is protected.", "WARN")
                     elif tag_action == 'r':
-                        # Recreate tag
                         cr = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag, "ref": FEATURE_BRANCH})
                         if isinstance(cr, dict) and cr.get("error_code") == 403:
-                            log(f"   ⚠️ Cannot create '{tag}': Tag creation is protected.", "WARN")
-                        else:
-                            log(f"   ✅ '{tag}' refreshed.")
-                    else:
-                        log(f"   ✅ '{tag}' terminated.")
+                            log(f"   ⚠️ Cannot recreate {tag}: Protected.", "WARN")
+                        else: log(f"   ✅ {tag} refreshed.")
+                    else: log(f"   ✅ {tag} terminated.")
 
-    log("Job finished.")
+    log("Job complete.")
 
 if __name__ == "__main__":
     main()
