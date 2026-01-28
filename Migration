@@ -1,0 +1,145 @@
+import urllib.request, json, base64, re, urllib.parse, datetime
+
+# --- CONFIGURATION (Update locally on VDI) ---
+COMPANY_DOMAIN = "company"  # Update to lfg.com
+BASE_URL = f"https://gitlab.{COMPANY_DOMAIN}.com/api/v4"
+TOKEN = ""  # Paste your token here
+PROJECT_IDS = []  # Paste your 12 IDs here
+
+# JIRA & Migration Setup
+JIRA_ID = "4323"
+UPGRADE_TYPE = "java17-migration"
+FEATURE_BRANCH = f"task-{JIRA_ID}-{UPGRADE_TYPE}"
+SOURCE_BRANCH = "develop"
+MR_TITLE = f"TASK-{JIRA_ID}: java migration"
+
+# Migration Targets
+TARGET_PARENT_VERSION = "1.8.3"
+NEW_DEFAULT_PLATFORM = "arn:aws:elasticbeanstalk:placeholder::platform/Corretto"
+
+# ---------------------------------------------------------
+
+def log(msg, level="INFO"):
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] [{level}] {msg}")
+
+def api_call(endpoint, method="GET", data=None):
+    url = f"{BASE_URL}/{endpoint}"
+    req = urllib.request.Request(url, method=method)
+    req.add_header("PRIVATE-TOKEN", TOKEN)
+    req.add_header("Content-Type", "application/json")
+    body = json.dumps(data).encode("utf-8") if data else None
+    try:
+        with urllib.request.urlopen(req, data=body) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return {"error_code": e.code, "message": e.reason}
+    except Exception as e:
+        log(f"API Error: {e}", "ERROR")
+        return None
+
+def update_parent_block(match):
+    block = match.group(0)
+    block = re.sub(r"(<version>).*?(</version>)", lambda m: m.group(1) + TARGET_PARENT_VERSION + m.group(2), block)
+    block = re.sub(r"(parent-pom-).*?(\.xml)", lambda m: m.group(1) + TARGET_PARENT_VERSION + m.group(2), block)
+    return block
+
+def main():
+    if not PROJECT_IDS: return log("Please add PROJECT_IDS.", "ERROR")
+
+    # --- INTERACTIVE SETUP ---
+    print("\n--- 🛠️  MIGRATION CONFIGURATION ---")
+    dry_run = input("Enable Dry Run (No changes committed)? (y/n): ").lower() == 'y'
+    print("\nSelect Updates (multiple allowed, e.g., 1,2,3):")
+    print("1: pom.xml (Java 17 & Parent)\n2: .gitlab-ci.yml (Clean image)\n3: .elasticbeanstalk/config.yml")
+    choices = input("Enter choices: ").split(',')
+    
+    tag_action = input("\nTag Action (t:Terminate, r:Refresh, n:Skip): ").lower()
+
+    for pid in PROJECT_IDS:
+        log(f"--- Starting Project ID: {pid} ---")
+        actions = []
+        
+        # Determine the latest point of truth (Feature branch or Develop)
+        branch_check = api_call(f"projects/{pid}/repository/branches/{FEATURE_BRANCH}")
+        current_ref = FEATURE_BRANCH if "name" in branch_check else SOURCE_BRANCH
+        
+        # 1. pom.xml
+        if '1' in choices:
+            res = api_call(f"projects/{pid}/repository/files/pom.xml?ref={current_ref}")
+            if isinstance(res, dict) and "content" in res:
+                original = base64.b64decode(res['content']).decode('utf-8')
+                updated = re.sub(r"<java\.version>11</java\.version>", "<java.version>17</java.version>", original)
+                updated = re.sub(r"<maven\.compiler\.(source|target)>11</maven\.compiler\.(source|target)>", 
+                                 lambda m: f"<maven.compiler.{m.group(1)}>17</maven.compiler.{m.group(1)}>", updated)
+                if re.search(r"(<parent>[\s\S]*?</parent>)", updated):
+                    updated = re.sub(r"(<parent>[\s\S]*?</parent>)", update_parent_block, updated)
+                
+                if original != updated:
+                    actions.append({"action": "update", "file_path": "pom.xml", "content": updated})
+                    log("   [DIFF] pom.xml requires updates.")
+                else:
+                    log(f"   [SKIP] pom.xml is already up-to-date on {current_ref}.")
+
+        # 2. .gitlab-ci.yml
+        if '2' in choices:
+            res = api_call(f"projects/{pid}/repository/files/.gitlab-ci.yml?ref={current_ref}")
+            if isinstance(res, dict) and "content" in res:
+                original = base64.b64decode(res['content']).decode('utf-8')
+                updated = re.sub(r"(maven-build:[\s\S]*?)\n\s*image:.*?\n", r"\1\n", original)
+                if original != updated:
+                    actions.append({"action": "update", "file_path": ".gitlab-ci.yml", "content": updated})
+                    log("   [DIFF] .gitlab-ci.yml requires updates.")
+                else:
+                    log(f"   [SKIP] .gitlab-ci.yml is already clean.")
+
+        # 3. .elasticbeanstalk/config.yml
+        if '3' in choices:
+            eb_path = ".elasticbeanstalk/config.yml"
+            encoded_path = urllib.parse.quote(eb_path, safe='')
+            res = api_call(f"projects/{pid}/repository/files/{encoded_path}?ref={current_ref}")
+            if isinstance(res, dict) and "content" in res:
+                original = base64.b64decode(res['content']).decode('utf-8')
+                updated = re.sub(r"(default_platform:\s*).*$", f"default_platform: {NEW_DEFAULT_PLATFORM}", original, flags=re.MULTILINE)
+                if original != updated:
+                    actions.append({"action": "update", "file_path": eb_path, "content": updated})
+                    log(f"   [DIFF] {eb_path} requires updates.")
+                else:
+                    log(f"   [SKIP] {eb_path} is already correct.")
+
+        # --- EXECUTION ---
+        if not actions or dry_run:
+            if dry_run and actions: log(f"   [DRY RUN] Would commit {len(actions)} files.", "WARN")
+        else:
+            # Branch Creation
+            if "name" not in branch_check:
+                api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH})
+            
+            # Commit
+            api_call(f"projects/{pid}/repository/commits", "POST", {"branch": FEATURE_BRANCH, "commit_message": f"fix: {UPGRADE_TYPE}", "actions": actions})
+            
+            # MR Management
+            mr_res = api_call(f"projects/{pid}/merge_requests", "POST", {"source_branch": FEATURE_BRANCH, "target_branch": SOURCE_BRANCH, "title": MR_TITLE})
+            if isinstance(mr_res, dict) and mr_res.get("error_code") == 409:
+                mrs = api_call(f"projects/{pid}/merge_requests?source_branch={FEATURE_BRANCH}")
+                if mrs: api_call(f"projects/{pid}/merge_requests/{mrs[0]['iid']}", "PUT", {"title": MR_TITLE})
+            log(f"   [SUCCESS] Code pushed and MR handled.")
+
+        # --- TAGS ---
+        if tag_action in ['t', 'r'] and not dry_run:
+            for tag in ["dev", "azure-dev"]:
+                exists = api_call(f"projects/{pid}/repository/tags/{tag}")
+                if isinstance(exists, dict) and "name" in exists:
+                    dr = api_call(f"projects/{pid}/repository/tags/{tag}", "DELETE")
+                    if isinstance(dr, dict) and dr.get("error_code") == 403:
+                        log(f"   [TAG] {tag} is protected. Skipping.", "WARN")
+                    elif tag_action == 'r':
+                        api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag, "ref": FEATURE_BRANCH})
+                        log(f"   [TAG] {tag} refreshed.")
+                    else:
+                        log(f"   [TAG] {tag} terminated.")
+
+    log("Migration job finished.")
+
+if __name__ == "__main__":
+    main()
